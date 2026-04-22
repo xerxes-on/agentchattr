@@ -103,7 +103,21 @@ def _is_loopback_host(host: str) -> bool:
 
 def _client_ip(conn) -> str:
     client = getattr(conn, "client", None)
-    return getattr(client, "host", "") if client else ""
+    direct = getattr(client, "host", "") if client else ""
+    headers = getattr(conn, "headers", None)
+    if headers and _is_loopback_host(direct):
+        cf_ip = headers.get("cf-connecting-ip", "").strip()
+        if cf_ip:
+            return cf_ip
+        forwarded = headers.get("x-forwarded-for", "").strip()
+        if forwarded:
+            first = forwarded.split(",", 1)[0].strip()
+            if first:
+                return first
+        real_ip = headers.get("x-real-ip", "").strip()
+        if real_ip:
+            return real_ip
+    return direct
 
 
 def _is_local_client(conn) -> bool:
@@ -163,7 +177,8 @@ def _origin_allowed(request: Request) -> bool:
 
 
 def _set_browser_session_cookies(response: Response, request: Request):
-    secure = request.url.scheme == "https"
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    secure = forwarded_proto == "https" or request.url.scheme == "https"
     response.set_cookie(
         _SESSION_COOKIE,
         session_token,

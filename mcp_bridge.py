@@ -14,8 +14,10 @@ import logging
 import threading
 import ipaddress
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from uploads import copy_upload_file, get_upload_dir
 
 log = logging.getLogger(__name__)
@@ -955,12 +957,31 @@ _ALL_TOOLS = [
 
 
 def _create_server(port: int) -> FastMCP:
+    allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    allowed_origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+    env_key = "AGENTCHATTR_MCP_SSE_URL" if port == 8201 else "AGENTCHATTR_MCP_HTTP_URL"
+    public_url = os.environ.get(env_key, "").strip()
+    if public_url:
+        parsed = urlsplit(public_url)
+        if parsed.netloc:
+            allowed_hosts.append(parsed.netloc)
+        if parsed.hostname:
+            allowed_hosts.append(parsed.hostname)
+            allowed_hosts.append(f"{parsed.hostname}:*")
+        if parsed.scheme and parsed.netloc:
+            allowed_origins.append(f"{parsed.scheme}://{parsed.netloc}")
+
     server = FastMCP(
         "agentchattr",
         host="127.0.0.1",
         port=port,
         log_level="ERROR",
         instructions=_MCP_INSTRUCTIONS,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=list(dict.fromkeys(allowed_hosts)),
+            allowed_origins=list(dict.fromkeys(allowed_origins)),
+        ),
     )
     for func in _ALL_TOOLS:
         server.tool()(func)

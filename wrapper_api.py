@@ -67,6 +67,9 @@ def main():
     parser.add_argument("--server-host",   default=None, help="Override network.server_host")
     parser.add_argument("--server-scheme", default=None, help="Override network.server_scheme")
     parser.add_argument("--shared-secret", default=None, help="Override network.shared_secret")
+    parser.add_argument("--web-url",       default=None, help="Override network.web_url")
+    parser.add_argument("--mcp-http-url",  default=None, help="Override network.mcp_http_url")
+    parser.add_argument("--mcp-sse-url",   default=None, help="Override network.mcp_sse_url")
     args = parser.parse_args()
 
     agent = args.agent

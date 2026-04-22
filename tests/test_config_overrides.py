@@ -23,6 +23,12 @@ ENV_VARS = [
     "AGENTCHATTR_MCP_HTTP_PORT",
     "AGENTCHATTR_MCP_SSE_PORT",
     "AGENTCHATTR_UPLOAD_DIR",
+    "AGENTCHATTR_SERVER_HOST",
+    "AGENTCHATTR_SERVER_SCHEME",
+    "AGENTCHATTR_SHARED_SECRET",
+    "AGENTCHATTR_WEB_URL",
+    "AGENTCHATTR_MCP_HTTP_URL",
+    "AGENTCHATTR_MCP_SSE_URL",
 ]
 
 
@@ -109,6 +115,21 @@ class ConfigOverrideTests(unittest.TestCase):
         self.assertIn("claude", config["agents"])
         self.assertEqual(config["agents"]["claude"]["command"], "claude")
 
+    def test_network_string_overrides_are_preserved_verbatim(self):
+        os.environ["AGENTCHATTR_SERVER_HOST"] = "demo.example.com"
+        os.environ["AGENTCHATTR_SERVER_SCHEME"] = "https"
+        os.environ["AGENTCHATTR_SHARED_SECRET"] = "topsecret"
+        os.environ["AGENTCHATTR_WEB_URL"] = "https://web.example.com"
+        os.environ["AGENTCHATTR_MCP_HTTP_URL"] = "https://mcp-http.example.com/mcp"
+        os.environ["AGENTCHATTR_MCP_SSE_URL"] = "https://mcp-sse.example.com/sse"
+        config = config_loader.load_config(ROOT)
+        self.assertEqual(config["network"]["server_host"], "demo.example.com")
+        self.assertEqual(config["network"]["server_scheme"], "https")
+        self.assertEqual(config["network"]["shared_secret"], "topsecret")
+        self.assertEqual(config["network"]["web_url"], "https://web.example.com")
+        self.assertEqual(config["network"]["mcp_http_url"], "https://mcp-http.example.com/mcp")
+        self.assertEqual(config["network"]["mcp_sse_url"], "https://mcp-sse.example.com/sse")
+
 
 class CliOverrideExtractionTests(unittest.TestCase):
     """apply_cli_overrides() extracts CLI flags into env vars.
@@ -169,6 +190,24 @@ class CliOverrideExtractionTests(unittest.TestCase):
         self.assertEqual(os.environ["AGENTCHATTR_MCP_HTTP_PORT"], "8210")
         self.assertEqual(os.environ["AGENTCHATTR_MCP_SSE_PORT"], "8211")
         self.assertEqual(os.environ["AGENTCHATTR_UPLOAD_DIR"], "/tmp/proj-uploads")
+
+    def test_network_flags_extracted(self):
+        argv = [
+            "wrapper.py",
+            "--server-host", "demo.example.com",
+            "--server-scheme", "https",
+            "--shared-secret", "topsecret",
+            "--web-url", "https://web.example.com",
+            "--mcp-http-url", "https://mcp-http.example.com/mcp",
+            "--mcp-sse-url", "https://mcp-sse.example.com/sse",
+        ]
+        config_loader.apply_cli_overrides(argv)
+        self.assertEqual(os.environ["AGENTCHATTR_SERVER_HOST"], "demo.example.com")
+        self.assertEqual(os.environ["AGENTCHATTR_SERVER_SCHEME"], "https")
+        self.assertEqual(os.environ["AGENTCHATTR_SHARED_SECRET"], "topsecret")
+        self.assertEqual(os.environ["AGENTCHATTR_WEB_URL"], "https://web.example.com")
+        self.assertEqual(os.environ["AGENTCHATTR_MCP_HTTP_URL"], "https://mcp-http.example.com/mcp")
+        self.assertEqual(os.environ["AGENTCHATTR_MCP_SSE_URL"], "https://mcp-sse.example.com/sse")
 
     def test_pass_through_separator_ignores_later_flags(self):
         # `-- --port 9999` belongs to the agent CLI, not agentchattr.

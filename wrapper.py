@@ -54,14 +54,33 @@ def _build_server_url(config: dict | None, port: int) -> str:
 
 
 def _web_base_url(config: dict | None) -> str:
+    explicit = str((config or {}).get("network", {}).get("web_url", "")).strip().rstrip("/")
+    if explicit:
+        return explicit
     port = (config or {}).get("server", {}).get("port", 8300)
     return _build_server_url(config, port)
 
 
 def _mcp_base_url(config: dict | None, transport: str) -> str:
+    net_cfg = (config or {}).get("network", {})
+    explicit = str(net_cfg.get("mcp_sse_url" if transport == "sse" else "mcp_http_url", "")).strip()
+    if explicit:
+        parsed = urlsplit(explicit)
+        path = parsed.path or ("/sse" if transport == "sse" else "/mcp")
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        return base.rstrip("/")
     mcp_cfg = (config or {}).get("mcp", {})
     port = mcp_cfg.get("sse_port", 8201) if transport == "sse" else mcp_cfg.get("http_port", 8200)
     return _build_server_url(config, port)
+
+
+def _mcp_path(config: dict | None, transport: str) -> str:
+    net_cfg = (config or {}).get("network", {})
+    explicit = str(net_cfg.get("mcp_sse_url" if transport == "sse" else "mcp_http_url", "")).strip()
+    if explicit:
+        parsed = urlsplit(explicit)
+        return parsed.path or ("/sse" if transport == "sse" else "/mcp")
+    return "/sse" if transport == "sse" else "/mcp"
 
 
 def _shared_secret_headers(config: dict | None) -> dict[str, str]:
@@ -226,8 +245,8 @@ def _resolve_mcp_inject(agent: str, agent_cfg: dict) -> dict:
 def _get_server_url(config: dict | None, mcp_cfg: dict, transport: str) -> str:
     """Build the MCP server URL for the given transport."""
     if transport == "sse":
-        return f"{_mcp_base_url(config, 'sse')}/sse"
-    return f"{_mcp_base_url(config, 'http')}/mcp"
+        return f"{_mcp_base_url(config, 'sse')}{_mcp_path(config, 'sse')}"
+    return f"{_mcp_base_url(config, 'http')}{_mcp_path(config, 'http')}"
 
 
 def _apply_mcp_inject(
@@ -649,6 +668,9 @@ def main():
     parser.add_argument("--server-host",   default=None, help="Override network.server_host")
     parser.add_argument("--server-scheme", default=None, help="Override network.server_scheme")
     parser.add_argument("--shared-secret", default=None, help="Override network.shared_secret")
+    parser.add_argument("--web-url",       default=None, help="Override network.web_url")
+    parser.add_argument("--mcp-http-url",  default=None, help="Override network.mcp_http_url")
+    parser.add_argument("--mcp-sse-url",   default=None, help="Override network.mcp_sse_url")
     args, extra = parser.parse_known_args()
 
     agent = args.agent
@@ -691,10 +713,10 @@ def main():
         transport = inject_cfg.get("mcp_transport", "http")
         if transport == "sse":
             upstream_base = _mcp_base_url(config, "sse")
-            proxy_path = "/sse"
+            proxy_path = _mcp_path(config, "sse")
         else:
             upstream_base = _mcp_base_url(config, "http")
-            proxy_path = "/mcp"
+            proxy_path = _mcp_path(config, "http")
 
         proxy = McpIdentityProxy(
             upstream_base=upstream_base,

@@ -15,6 +15,9 @@ isolated instances per project without editing the repo's config file.
   AGENTCHATTR_SERVER_HOST     → network.server_host
   AGENTCHATTR_SERVER_SCHEME   → network.server_scheme
   AGENTCHATTR_SHARED_SECRET   → network.shared_secret
+  AGENTCHATTR_WEB_URL         → network.web_url
+  AGENTCHATTR_MCP_HTTP_URL    → network.mcp_http_url
+  AGENTCHATTR_MCP_SSE_URL     → network.mcp_sse_url
 
 Relative paths in env var overrides resolve against the current working
 directory (where the user invoked the command from), not agentchattr's
@@ -39,6 +42,9 @@ _ENV_OVERRIDES = [
     ("AGENTCHATTR_SERVER_HOST",   "network", "server_host", False),
     ("AGENTCHATTR_SERVER_SCHEME", "network", "server_scheme", False),
     ("AGENTCHATTR_SHARED_SECRET", "network", "shared_secret", False),
+    ("AGENTCHATTR_WEB_URL",       "network", "web_url", False),
+    ("AGENTCHATTR_MCP_HTTP_URL",  "network", "mcp_http_url", False),
+    ("AGENTCHATTR_MCP_SSE_URL",   "network", "mcp_sse_url", False),
 ]
 
 # Mapping: CLI flag → env var (for apply_cli_overrides)
@@ -51,6 +57,9 @@ CLI_OVERRIDE_FLAGS = [
     ("--server-host",   "AGENTCHATTR_SERVER_HOST"),
     ("--server-scheme", "AGENTCHATTR_SERVER_SCHEME"),
     ("--shared-secret", "AGENTCHATTR_SHARED_SECRET"),
+    ("--web-url",       "AGENTCHATTR_WEB_URL"),
+    ("--mcp-http-url",  "AGENTCHATTR_MCP_HTTP_URL"),
+    ("--mcp-sse-url",   "AGENTCHATTR_MCP_SSE_URL"),
 ]
 
 
@@ -100,7 +109,10 @@ def _apply_env_overrides(config: dict) -> None:
                 print(f"  Warning: {env_var}={raw!r} is not a valid integer, ignoring")
                 continue
         else:
-            if key in ("server_host", "server_scheme", "shared_secret"):
+            if key in (
+                "server_host", "server_scheme", "shared_secret",
+                "web_url", "mcp_http_url", "mcp_sse_url",
+            ):
                 value = raw
             else:
                 # Path values: resolve relative paths against current working dir,
