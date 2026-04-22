@@ -32,6 +32,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).parent
 
 SERVER_NAME = "agentchattr"
+_HTTP_USER_AGENT = "agentchattr-wrapper/1.0 (+https://chat.xerxes.uz)"
 
 
 def _normalize_server_host(config: dict | None) -> str:
@@ -83,11 +84,26 @@ def _mcp_path(config: dict | None, transport: str) -> str:
     return "/sse" if transport == "sse" else "/mcp"
 
 
+def _resolve_agent_cwd(agent_cfg: dict) -> Path:
+    override = os.environ.get("AGENTCHATTR_AGENT_CWD", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    raw = str(agent_cfg.get("cwd", ".")).strip() or "."
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return (ROOT / p).resolve()
+
+
 def _shared_secret_headers(config: dict | None) -> dict[str, str]:
     secret = str((config or {}).get("network", {}).get("shared_secret", "")).strip()
-    if not secret:
-        return {}
-    return {"X-Agentchattr-Shared-Secret": secret}
+    headers = {
+        "User-Agent": _HTTP_USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+    }
+    if secret:
+        headers["X-Agentchattr-Shared-Secret"] = secret
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +225,7 @@ _BUILTIN_DEFAULTS: dict[str, dict] = {
         "mcp_merge_project": True,
     },
     "codex": {
-        "mcp_inject": "proxy_flag",
-        "mcp_proxy_flag_template": '-c mcp_servers.{server}.url="{url}"',
+        "mcp_inject": "codex_http",
         # mcp_merge_project disabled — Codex reads .mcp.json natively,
         # and duplicate detection is name-based only (e.g. unityMCP vs unity-mcp)
     },
@@ -227,7 +242,24 @@ _BUILTIN_DEFAULTS: dict[str, dict] = {
     },
 }
 
-_VALID_INJECT_MODES = {"settings_file", "env", "flag", "proxy_flag", "env_content"}
+_VALID_INJECT_MODES = {"settings_file", "env", "flag", "proxy_flag", "env_content", "codex_http"}
+
+_AUTO_APPROVE_ARGS: dict[str, list[str]] = {
+    "claude": ["--dangerously-skip-permissions"],
+    "codex": ["--dangerously-bypass-approvals-and-sandbox"],
+}
+
+
+def _apply_default_agent_args(agent: str, extra_args: list[str]) -> list[str]:
+    defaults = _AUTO_APPROVE_ARGS.get(agent, [])
+    if not defaults:
+        return list(extra_args)
+
+    merged = list(extra_args)
+    for flag in defaults:
+        if flag not in merged:
+            merged.insert(0, flag)
+    return merged
 
 
 def _resolve_mcp_inject(agent: str, agent_cfg: dict) -> dict:
@@ -671,11 +703,16 @@ def main():
     parser.add_argument("--web-url",       default=None, help="Override network.web_url")
     parser.add_argument("--mcp-http-url",  default=None, help="Override network.mcp_http_url")
     parser.add_argument("--mcp-sse-url",   default=None, help="Override network.mcp_sse_url")
+    parser.add_argument("--cwd",           default=None, help="Override agent working directory")
     args, extra = parser.parse_known_args()
 
     agent = args.agent
     agent_cfg = config.get("agents", {}).get(agent, {})
-    cwd = agent_cfg.get("cwd", ".")
+    extra = _apply_default_agent_args(agent, extra)
+    if args.cwd:
+        os.environ["AGENTCHATTR_AGENT_CWD"] = args.cwd
+    project_dir = _resolve_agent_cwd(agent_cfg)
+    cwd = str(project_dir)
     command = agent_cfg.get("command", agent)
     data_dir = ROOT / config.get("server", {}).get("data_dir", "./data")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -753,7 +790,7 @@ def main():
             _apply_mcp_inject(
                 inject_cfg, instance_name, data_dir, proxy_url,
                 token=new_token, config=config, mcp_cfg=mcp_cfg,
-                project_dir=(ROOT / cwd).resolve(),
+                project_dir=project_dir,
             )
         except Exception:
             pass
@@ -798,8 +835,6 @@ def main():
         print("  Install it first, then try again.")
         sys.exit(1)
     command = resolved
-
-    project_dir = (ROOT / cwd).resolve()
 
     # Gemini: ensure the project directory is trusted so MCPs are allowed.
     # Gemini blocks ALL MCPs for untrusted folders — even system-settings ones.

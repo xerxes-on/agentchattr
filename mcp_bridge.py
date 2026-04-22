@@ -977,6 +977,7 @@ def _create_server(port: int) -> FastMCP:
         port=port,
         log_level="ERROR",
         instructions=_MCP_INSTRUCTIONS,
+        json_response=(port == 8200),
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=list(dict.fromkeys(allowed_hosts)),
