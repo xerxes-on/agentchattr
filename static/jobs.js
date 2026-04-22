@@ -1116,7 +1116,7 @@ function appendJobMessage(msg) {
         if (msg.attachments && msg.attachments.length > 0) {
             attHtml = '<div class="job-msg-attachments">';
             for (const att of msg.attachments) {
-                attHtml += `<img src="${window.escapeHtml(att.url)}" alt="${window.escapeHtml(att.name || '')}" onclick="openImageModal('${window.escapeHtml(att.url)}')">`;
+                attHtml += window.renderAttachmentMarkup(att);
             }
             attHtml += '</div>';
         }
@@ -1163,6 +1163,7 @@ async function sendJobMessage() {
                 sender: window.username,
                 attachments: jobPendingAttachments.map(a => ({
                     path: a.path, name: a.name, url: a.url,
+                    kind: a.kind, media_type: a.media_type, size: a.size,
                 })),
             }),
         });
@@ -1183,7 +1184,15 @@ async function uploadJobImage(file) {
     try {
         const resp = await fetch('/api/upload', { method: 'POST', headers: { 'X-Session-Token': window.SESSION_TOKEN }, body: form });
         const data = await resp.json();
-        jobPendingAttachments.push({ path: data.path, name: data.name, url: data.url });
+        if (!resp.ok) throw new Error(data.error || 'Upload failed');
+        jobPendingAttachments.push({
+            path: data.path,
+            name: data.name,
+            url: data.url,
+            kind: data.kind,
+            media_type: data.media_type,
+            size: data.size,
+        });
         renderJobAttachments();
     } catch (err) {
         console.error('Job upload failed:', err);
@@ -1197,7 +1206,7 @@ function renderJobAttachments() {
     jobPendingAttachments.forEach((att, i) => {
         const wrap = document.createElement('div');
         wrap.className = 'attachment-preview';
-        wrap.innerHTML = `<img src="${att.url}" alt="${window.escapeHtml(att.name)}"><button class="remove-btn" onclick="removeJobAttachment(${i})">x</button>`;
+        wrap.innerHTML = `${window.renderAttachmentMarkup(att, { preview: true })}<button class="remove-btn" onclick="removeJobAttachment(${i})">x</button>`;
         container.appendChild(wrap);
     });
 }

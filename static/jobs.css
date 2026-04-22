@@ -883,16 +883,25 @@ body.archive-no-select * {
 
 .job-attachments .attachment-preview {
     position: relative;
-    width: 60px;
-    height: 60px;
+    display: inline-flex;
 }
 
 .job-attachments .attachment-preview img {
+    width: 60px;
+    height: 60px;
     width: 100%;
     height: 100%;
     object-fit: cover;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
+}
+
+.job-attachments .attachment-preview .attachment-file-preview {
+    min-width: 180px;
+    max-width: 220px;
+    min-height: 60px;
+    justify-content: center;
+    padding-right: 26px;
 }
 
 .job-msg-attachments {

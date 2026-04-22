@@ -12,6 +12,9 @@ isolated instances per project without editing the repo's config file.
   AGENTCHATTR_MCP_HTTP_PORT   → mcp.http_port         (int)
   AGENTCHATTR_MCP_SSE_PORT    → mcp.sse_port          (int)
   AGENTCHATTR_UPLOAD_DIR      → images.upload_dir
+  AGENTCHATTR_SERVER_HOST     → network.server_host
+  AGENTCHATTR_SERVER_SCHEME   → network.server_scheme
+  AGENTCHATTR_SHARED_SECRET   → network.shared_secret
 
 Relative paths in env var overrides resolve against the current working
 directory (where the user invoked the command from), not agentchattr's
@@ -33,6 +36,9 @@ _ENV_OVERRIDES = [
     ("AGENTCHATTR_MCP_HTTP_PORT", "mcp",    "http_port",  True),
     ("AGENTCHATTR_MCP_SSE_PORT",  "mcp",    "sse_port",   True),
     ("AGENTCHATTR_UPLOAD_DIR",    "images", "upload_dir", False),
+    ("AGENTCHATTR_SERVER_HOST",   "network", "server_host", False),
+    ("AGENTCHATTR_SERVER_SCHEME", "network", "server_scheme", False),
+    ("AGENTCHATTR_SHARED_SECRET", "network", "shared_secret", False),
 ]
 
 # Mapping: CLI flag → env var (for apply_cli_overrides)
@@ -42,6 +48,9 @@ CLI_OVERRIDE_FLAGS = [
     ("--mcp-http-port", "AGENTCHATTR_MCP_HTTP_PORT"),
     ("--mcp-sse-port",  "AGENTCHATTR_MCP_SSE_PORT"),
     ("--upload-dir",    "AGENTCHATTR_UPLOAD_DIR"),
+    ("--server-host",   "AGENTCHATTR_SERVER_HOST"),
+    ("--server-scheme", "AGENTCHATTR_SERVER_SCHEME"),
+    ("--shared-secret", "AGENTCHATTR_SHARED_SECRET"),
 ]
 
 
@@ -91,12 +100,15 @@ def _apply_env_overrides(config: dict) -> None:
                 print(f"  Warning: {env_var}={raw!r} is not a valid integer, ignoring")
                 continue
         else:
-            # Path values: resolve relative paths against current working dir,
-            # not against agentchattr's install directory.
-            p = Path(raw)
-            if not p.is_absolute():
-                p = (Path.cwd() / p).resolve()
-            value = str(p)
+            if key in ("server_host", "server_scheme", "shared_secret"):
+                value = raw
+            else:
+                # Path values: resolve relative paths against current working dir,
+                # not against agentchattr's install directory.
+                p = Path(raw)
+                if not p.is_absolute():
+                    p = (Path.cwd() / p).resolve()
+                value = str(p)
         config.setdefault(section, {})[key] = value
 
 

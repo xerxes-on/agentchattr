@@ -5,14 +5,18 @@ Serves two transports for compatibility:
   - SSE on port 8201 (Gemini)
 """
 
+from __future__ import annotations
+
 import json
 import os
 import time
 import logging
 import threading
+import ipaddress
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
+from uploads import copy_upload_file, get_upload_dir
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +150,42 @@ def _extract_agent_token(ctx: Context | None) -> str:
     return headers.get("x-agent-token", "").strip()
 
 
+def _request_client_host(ctx: Context | None) -> str:
+    if ctx is None:
+        return ""
+    try:
+        request = ctx.request_context.request
+    except Exception:
+        return ""
+    client = getattr(request, "client", None)
+    return getattr(client, "host", "") if client else ""
+
+
+def _is_loopback_host(host: str) -> bool:
+    raw = (host or "").strip().lower()
+    if not raw:
+        return False
+    if raw == "localhost":
+        return True
+    raw = raw.split("%", 1)[0].strip("[]")
+    try:
+        return ipaddress.ip_address(raw).is_loopback
+    except ValueError:
+        return False
+
+
+def _remote_agent_auth_error(ctx: Context | None) -> str | None:
+    if _is_loopback_host(_request_client_host(ctx)):
+        return None
+    secret = str((config or {}).get("network", {}).get("shared_secret", "")).strip()
+    if not secret:
+        return "Error: remote MCP access is disabled until network.shared_secret is set."
+    headers = _request_headers(ctx) or {}
+    if headers.get("x-agentchattr-shared-secret", "").strip() != secret:
+        return "Error: valid shared secret required for remote MCP access."
+    return None
+
+
 def _authenticated_instance(ctx: Context | None) -> dict | None:
     if not registry:
         return None
@@ -162,6 +202,8 @@ def _resolve_tool_identity(
     field_name: str,
     required: bool = False,
 ) -> tuple[str, str | None]:
+    if (secret_err := _remote_agent_auth_error(ctx)):
+        return "", secret_err
     provided = raw_name.strip() if raw_name else ""
     token = _extract_agent_token(ctx)
     inst = _authenticated_instance(ctx)
@@ -195,13 +237,14 @@ def chat_send(
     message: str,
     choices: list[str] = [],
     image_path: str = "",
+    file_path: str = "",
     reply_to: int = -1,
     channel: str = "",
     job_id: int = 0,
     ctx: Context | None = None,
 ) -> str:
     """Send a message to the agentchattr chat. Use your name as sender (claude/codex/user).
-    Optionally attach a local image by providing image_path (absolute path).
+    Optionally attach a local image or file by providing image_path/file_path (absolute path).
     Optionally reply to a message by providing reply_to (message ID).
     Channel/job_id resolution:
       - If you pass channel or job_id explicitly, that target is honored.
@@ -247,8 +290,22 @@ def chat_send(
     # Block unregistered agent names (stale identity from resumed session)
     if registry and registry.is_agent_family(sender) and not registry.is_registered(sender):
         return f"Error: sender '{sender}' is not registered. Call chat_claim(sender=your_base_name) to get your identity."
-    if not message.strip() and not image_path:
+    if not message.strip() and not image_path and not file_path:
         return "Empty message, not sent."
+
+    def _collect_local_attachments() -> tuple[list[dict], str | None]:
+        attachments: list[dict] = []
+        for raw_path in (image_path, file_path):
+            if not raw_path:
+                continue
+            src = Path(raw_path)
+            if not src.exists():
+                return [], f"File not found: {raw_path}"
+            try:
+                attachments.append(copy_upload_file(src, config))
+            except ValueError as exc:
+                return [], f"Unsupported file type: {exc}"
+        return attachments, None
 
     # Job-scoped send: post into a job conversation instead of main timeline
     if job_id and jobs:
@@ -258,25 +315,11 @@ def chat_send(
         if text.lower().startswith("[suggestion]"):
             msg_type = "suggestion"
             text = text[len("[suggestion]"):].strip()
-        # Handle image attachment for job messages
-        job_attachments = None
-        if image_path:
-            import shutil, uuid
-            src = Path(image_path)
-            if not src.exists():
-                return f"Image not found: {image_path}"
-            if src.suffix.lower() not in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'):
-                return f"Unsupported image type: {src.suffix}"
-            raw_dir = "./uploads"
-            if config and "images" in config:
-                raw_dir = config["images"].get("upload_dir", raw_dir)
-            upload_dir = Path(raw_dir)
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{uuid.uuid4().hex[:8]}{src.suffix}"
-            shutil.copy2(str(src), str(upload_dir / filename))
-            job_attachments = [{"name": src.name, "url": f"/uploads/{filename}"}]
+        job_attachments, upload_err = _collect_local_attachments()
+        if upload_err:
+            return upload_err
         msg = jobs.add_message(job_id, sender, text, msg_type=msg_type,
-                               attachments=job_attachments)
+                               attachments=job_attachments or None)
         if msg is None:
             return f"Error: job #{job_id} not found."
         with _presence_lock:
@@ -308,27 +351,9 @@ def chat_send(
         return f"Sent to job #{job_id} (msg_id={msg['id']})" + (
             " [suggestion]" if msg_type == "suggestion" else "")
 
-    attachments = []
-    if image_path:
-        import shutil
-        import uuid
-        from pathlib import Path
-        src = Path(image_path)
-        if not src.exists():
-            return f"Image not found: {image_path}"
-        if src.suffix.lower() not in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'):
-            return f"Unsupported image type: {src.suffix}"
-        
-        # Get upload dir from config (fall back to ./uploads)
-        raw_dir = "./uploads"
-        if config and "images" in config:
-            raw_dir = config["images"].get("upload_dir", raw_dir)
-        upload_dir = Path(raw_dir)
-        
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{uuid.uuid4().hex[:8]}{src.suffix}"
-        shutil.copy2(str(src), str(upload_dir / filename))
-        attachments.append({"name": src.name, "url": f"/uploads/{filename}"})
+    attachments, upload_err = _collect_local_attachments()
+    if upload_err:
+        return upload_err
 
     reply_id = reply_to if reply_to >= 0 else None
     if reply_id is not None and store.get_by_id(reply_id) is None:
@@ -388,13 +413,10 @@ def chat_propose_job(
 
 
 def _resolve_attachments(attachments: list[dict]) -> list[dict]:
-    """Add absolute file_path to attachments so agents can read images."""
+    """Add absolute file_path to attachments so agents can read shared files."""
     if not attachments:
         return attachments
-    raw_dir = "./uploads"
-    if config and "images" in config:
-        raw_dir = config["images"].get("upload_dir", raw_dir)
-    upload_dir = Path(raw_dir).resolve()
+    upload_dir = get_upload_dir(config).resolve()
     resolved = []
     for att in attachments:
         a = dict(att)
@@ -960,4 +982,3 @@ def run_http_server():
 def run_sse_server():
     """Block — run SSE MCP in a background thread."""
     mcp_sse.run(transport="sse")
-

@@ -18,6 +18,8 @@ How it works:
   6. On exit: deregisters cleanly.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -31,16 +33,9 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 
 
-def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
-    headers = {"Authorization": f"Bearer {token}"}
-    if include_json:
-        headers["Content-Type"] = "application/json"
-    return headers
-
-
 def main():
     from config_loader import apply_cli_overrides, load_config
-    from wrapper import _register_instance
+    from wrapper import _auth_headers, _register_instance, _web_base_url
 
     # Apply AGENTCHATTR_* overrides (from CLI flags or env) BEFORE loading
     # config so the API wrapper connects to the same data_dir/ports as a
@@ -69,11 +64,13 @@ def main():
     parser.add_argument("--mcp-http-port", default=None, help="Override mcp.http_port (int)")
     parser.add_argument("--mcp-sse-port",  default=None, help="Override mcp.sse_port (int)")
     parser.add_argument("--upload-dir",    default=None, help="Override images.upload_dir (path)")
+    parser.add_argument("--server-host",   default=None, help="Override network.server_host")
+    parser.add_argument("--server-scheme", default=None, help="Override network.server_scheme")
+    parser.add_argument("--shared-secret", default=None, help="Override network.shared_secret")
     args = parser.parse_args()
 
     agent = args.agent
     agent_cfg = config["agents"][agent]
-    server_port = config.get("server", {}).get("port", 8300)
     data_dir = ROOT / config.get("server", {}).get("data_dir", "./data")
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -101,7 +98,7 @@ def main():
 
     # Register with server
     try:
-        registration = _register_instance(server_port, agent, args.label)
+        registration = _register_instance(config, agent, args.label)
     except Exception as exc:
         print(f"  Registration failed ({exc}).")
         print("  Is the server running? Start it with: python run.py")
@@ -145,10 +142,10 @@ def main():
                 n = get_name()
                 t = get_token()
                 req = urllib.request.Request(
-                    f"http://127.0.0.1:{server_port}/api/heartbeat/{n}",
+                    f"{_web_base_url(config)}/api/heartbeat/{n}",
                     method="POST",
                     data=json.dumps({"active": is_working()}).encode(),
-                    headers=_auth_headers(t, include_json=True),
+                    headers=_auth_headers(t, config, include_json=True),
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     resp_data = json.loads(resp.read())
@@ -159,7 +156,7 @@ def main():
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
                     try:
-                        replacement = _register_instance(server_port, agent, args.label)
+                        replacement = _register_instance(config, agent, args.label)
                         set_identity(replacement["name"], replacement["token"])
                         print(f"  Re-registered as: {replacement['name']}")
                     except Exception:
@@ -174,8 +171,8 @@ def main():
     def get_my_role():
         try:
             req = urllib.request.Request(
-                f"http://127.0.0.1:{server_port}/api/status",
-                headers=_auth_headers(get_token()),
+                f"{_web_base_url(config)}/api/status",
+                headers=_auth_headers(get_token(), config),
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 status = json.loads(resp.read())
@@ -189,8 +186,8 @@ def main():
     def get_online_agents():
         try:
             req = urllib.request.Request(
-                f"http://127.0.0.1:{server_port}/api/status",
-                headers=_auth_headers(get_token()),
+                f"{_web_base_url(config)}/api/status",
+                headers=_auth_headers(get_token(), config),
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 status = json.loads(resp.read())
@@ -206,8 +203,8 @@ def main():
         if since_id:
             params = f"since_id={since_id}&{params}"
         req = urllib.request.Request(
-            f"http://127.0.0.1:{server_port}/api/messages?{params}",
-            headers=_auth_headers(get_token()),
+            f"{_web_base_url(config)}/api/messages?{params}",
+            headers=_auth_headers(get_token(), config),
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
@@ -216,10 +213,10 @@ def main():
     def send_message(text, channel="general"):
         body = json.dumps({"text": text, "channel": channel}).encode()
         req = urllib.request.Request(
-            f"http://127.0.0.1:{server_port}/api/send",
+            f"{_web_base_url(config)}/api/send",
             method="POST",
             data=body,
-            headers=_auth_headers(get_token(), include_json=True),
+            headers=_auth_headers(get_token(), config, include_json=True),
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
@@ -352,10 +349,10 @@ def main():
             n = get_name()
             t = get_token()
             req = urllib.request.Request(
-                f"http://127.0.0.1:{server_port}/api/deregister/{n}",
+                f"{_web_base_url(config)}/api/deregister/{n}",
                 method="POST",
                 data=b"",
-                headers=_auth_headers(t),
+                headers=_auth_headers(t, config),
             )
             urllib.request.urlopen(req, timeout=5)
             print(f"  Deregistered {n}")

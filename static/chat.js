@@ -369,7 +369,7 @@ function addCodeCopyButtons(container) {
 
 function connectWebSocket() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(SESSION_TOKEN)}`);
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
 
     ws.onopen = () => {
         console.log('WebSocket connected');
@@ -615,6 +615,42 @@ function connectWebSocket() {
     };
 }
 
+function isImageAttachment(att) {
+    const type = (att?.media_type || '').toLowerCase();
+    const kind = (att?.kind || '').toLowerCase();
+    const name = `${att?.name || ''} ${att?.url || ''}`.toLowerCase();
+    return kind === 'image'
+        || type.startsWith('image/')
+        || /\.(png|jpe?g|gif|webp|bmp|svg)$/.test(name);
+}
+
+function formatFileSize(bytes) {
+    const n = Number(bytes || 0);
+    if (!Number.isFinite(n) || n <= 0) return '';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderAttachmentMarkup(att, { preview = false, className = '' } = {}) {
+    const name = escapeHtml(att?.name || 'attachment');
+    const url = escapeHtml(att?.url || '#');
+    const size = formatFileSize(att?.size);
+    const meta = [att?.kind === 'file' ? 'file' : '', size].filter(Boolean).join(' • ');
+
+    if (isImageAttachment(att)) {
+        const imgClass = className ? ` class="${className}"` : '';
+        return `<img${imgClass} src="${url}" alt="${name}" onclick="openImageModal('${url}')" title="${preview ? 'Click to preview' : name}">`;
+    }
+
+    return `
+        <a class="attachment-file${preview ? ' attachment-file-preview' : ''}" href="${url}" target="_blank" rel="noopener" download>
+            <span class="attachment-file-name">${name}</span>
+            ${meta ? `<span class="attachment-file-meta">${escapeHtml(meta)}</span>` : ''}
+        </a>
+    `;
+}
+
 // --- Date dividers ---
 
 function getMessageDate(msg) {
@@ -767,7 +803,7 @@ function appendMessage(msg) {
         if (msg.attachments && msg.attachments.length > 0) {
             attachmentsHtml = '<div class="msg-attachments">';
             for (const att of msg.attachments) {
-                attachmentsHtml += `<img src="${escapeHtml(att.url)}" alt="${escapeHtml(att.name)}" onclick="openImageModal('${escapeHtml(att.url)}')">`;
+                attachmentsHtml += renderAttachmentMarkup(att);
             }
             attachmentsHtml += '</div>';
         }
@@ -2377,13 +2413,13 @@ function setupPaste() {
         const isJobFocused = jobInput && document.activeElement === jobInput;
 
         for (const item of items) {
-            if (item.type.startsWith('image/')) {
+            if (item.kind === 'file') {
                 e.preventDefault();
                 const file = item.getAsFile();
                 if (isJobFocused) {
                     await uploadJobImage(file);
                 } else {
-                    await uploadImage(file);
+                    await uploadAttachment(file);
                 }
             }
         }
@@ -2424,25 +2460,27 @@ function setupDragDrop() {
         if (!files) return;
 
         for (const file of files) {
-            if (file.type.startsWith('image/')) {
-                await uploadImage(file);
-            }
+            await uploadAttachment(file);
         }
     });
 }
 
-async function uploadImage(file) {
+async function uploadAttachment(file) {
     const form = new FormData();
     form.append('file', file);
 
     try {
         const resp = await fetch('/api/upload', { method: 'POST', headers: { 'X-Session-Token': SESSION_TOKEN }, body: form });
         const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Upload failed');
 
         pendingAttachments.push({
             path: data.path,
             name: data.name,
             url: data.url,
+            kind: data.kind,
+            media_type: data.media_type,
+            size: data.size,
         });
 
         renderAttachments();
@@ -2459,7 +2497,7 @@ function renderAttachments() {
         const wrap = document.createElement('div');
         wrap.className = 'attachment-preview';
         wrap.innerHTML = `
-            <img src="${att.url}" alt="${escapeHtml(att.name)}" onclick="openImageModal('${escapeHtml(att.url)}')" title="Click to preview">
+            ${renderAttachmentMarkup(att, { preview: true })}
             <button class="remove-btn" onclick="removeAttachment(${i})">x</button>
         `;
         container.appendChild(wrap);
@@ -2477,6 +2515,9 @@ function clearAttachments() {
     document.getElementById('attachments').innerHTML = '';
     repositionScrollAnchor();
 }
+
+const uploadImage = uploadAttachment;
+window.renderAttachmentMarkup = renderAttachmentMarkup;
 
 // --- Scroll tracking ---
 

@@ -2455,6 +2455,9 @@ body.channels-in-sidebar #channel-bar {
 
 .msg-attachments {
     margin-top: 6px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
 }
 
 .msg-attachments img {
@@ -2471,6 +2474,36 @@ body.channels-in-sidebar #channel-bar {
     border-color: var(--accent);
     transform: scale(1.02);
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.attachment-file {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 160px;
+    max-width: 280px;
+    padding: 10px 12px;
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
+    background: var(--bg-subtle);
+    color: var(--text);
+    text-decoration: none;
+}
+
+.attachment-file:hover {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.attachment-file-name {
+    font-size: 13px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.attachment-file-meta {
+    font-size: 11px;
+    color: var(--text-dim);
 }
 
 /* --- Typing indicator --- */
@@ -3171,7 +3204,7 @@ footer {
 
 #attachments .attachment-preview {
     position: relative;
-    display: inline-block;
+    display: inline-flex;
 }
 
 #attachments .attachment-preview img {
@@ -3184,6 +3217,14 @@ footer {
 }
 #attachments .attachment-preview img:hover {
     border-color: var(--accent);
+}
+
+#attachments .attachment-preview .attachment-file-preview {
+    min-width: 180px;
+    max-width: 220px;
+    min-height: 60px;
+    justify-content: center;
+    padding-right: 26px;
 }
 
 #attachments .attachment-preview .remove-btn {

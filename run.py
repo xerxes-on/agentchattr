@@ -58,7 +58,16 @@ def main():
     session_token = secrets.token_hex(32)
 
     # Configure the FastAPI app (creates shared store)
-    from app import app, configure, set_event_loop, store as _store_ref
+    from app import (
+        app,
+        configure,
+        set_event_loop,
+        store as _store_ref,
+        _browser_has_access,
+        _is_local_client,
+        _remote_access_enabled,
+        _set_browser_session_cookies,
+    )
     configure(config, session_token=session_token)
 
     # Share stores with the MCP bridge
@@ -94,22 +103,61 @@ def main():
 
     # Mount static files
     from fastapi.staticfiles import StaticFiles
+    from fastapi.requests import Request
     from fastapi.responses import HTMLResponse
 
     static_dir = ROOT / "static"
 
     @app.get("/")
-    async def index():
+    async def index(request: Request):
         # Read index.html fresh each request so changes take effect without restart.
-        # Inject the session token into the HTML so the browser client can use it.
-        # This is safe: same-origin policy prevents cross-origin pages from reading
-        # the response body, so only the user's own browser tab gets the token.
+        # Remote browsers need an access secret before they receive a session.
+        if not _is_local_client(request):
+            if not _remote_access_enabled():
+                return HTMLResponse(
+                    """
+                    <!DOCTYPE html>
+                    <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+                    <title>agentchattr</title>
+                    <style>
+                    body{font-family:ui-sans-serif,system-ui,sans-serif;background:#0d1117;color:#e6edf3;display:grid;place-items:center;min-height:100vh;margin:0}
+                    main{max-width:520px;padding:32px;border:1px solid #30363d;border-radius:16px;background:#161b22}
+                    code{background:#0d1117;padding:2px 6px;border-radius:6px}
+                    </style></head><body><main><h1>Remote access disabled</h1>
+                    <p>Set <code>network.shared_secret</code> before using agentchattr from another device.</p>
+                    </main></body></html>
+                    """,
+                    status_code=403,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if not _browser_has_access(request):
+                return HTMLResponse(
+                    """
+                    <!DOCTYPE html>
+                    <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+                    <title>agentchattr login</title>
+                    <style>
+                    body{font-family:ui-sans-serif,system-ui,sans-serif;background:#0d1117;color:#e6edf3;display:grid;place-items:center;min-height:100vh;margin:0}
+                    form{display:grid;gap:12px;min-width:320px;max-width:360px;padding:28px;border:1px solid #30363d;border-radius:16px;background:#161b22}
+                    input,button{font:inherit;padding:12px 14px;border-radius:10px;border:1px solid #30363d}
+                    input{background:#0d1117;color:#e6edf3}
+                    button{background:#238636;color:#fff;cursor:pointer}
+                    p{margin:0;color:#8b949e;font-size:14px}
+                    </style></head><body>
+                    <form method="post" action="/auth/login" autocomplete="off">
+                        <h1 style="margin:0">agentchattr</h1>
+                        <p>Enter the shared access secret for this room.</p>
+                        <input type="password" name="secret" placeholder="Shared secret" required autofocus>
+                        <button type="submit">Enter room</button>
+                    </form>
+                    </body></html>
+                    """,
+                    headers={"Cache-Control": "no-store"},
+                )
         html = (static_dir / "index.html").read_text("utf-8")
-        injected = html.replace(
-            "</head>",
-            f'<script>window.__SESSION_TOKEN__="{session_token}";</script>\n</head>',
-        )
-        return HTMLResponse(injected, headers={"Cache-Control": "no-store"})
+        response = HTMLResponse(html, headers={"Cache-Control": "no-store"})
+        _set_browser_session_cookies(response, request)
+        return response
 
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
@@ -157,11 +205,14 @@ def main():
     print(f"  MCP SSE:  http://{host}:{sse_port}/sse   (Gemini)")
     print(f"  Data:    {data_dir}")
     print(f"  Agents auto-trigger on @mention")
-    print(f"\n  Session token: {session_token}\n")
+    if config.get("network", {}).get("shared_secret"):
+        print("  Remote access: enabled (shared secret required)")
+    else:
+        print("  Remote access: disabled until network.shared_secret is set")
+    print()
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
     main()
-

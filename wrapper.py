@@ -18,6 +18,8 @@ How it works:
   4. The agent picks up the prompt as if the user typed it.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import shutil
@@ -25,10 +27,48 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).parent
 
 SERVER_NAME = "agentchattr"
+
+
+def _normalize_server_host(config: dict | None) -> str:
+    cfg = config or {}
+    net_cfg = cfg.get("network", {})
+    host = (net_cfg.get("server_host") or cfg.get("server", {}).get("host") or "127.0.0.1").strip()
+    if host in ("0.0.0.0", "::", "[::]"):
+        return "127.0.0.1"
+    parsed = urlsplit(host if "://" in host else f"//{host}")
+    return parsed.hostname or host
+
+
+def _server_scheme(config: dict | None) -> str:
+    scheme = str((config or {}).get("network", {}).get("server_scheme", "http")).strip().lower()
+    return scheme if scheme in ("http", "https") else "http"
+
+
+def _build_server_url(config: dict | None, port: int) -> str:
+    return f"{_server_scheme(config)}://{_normalize_server_host(config)}:{port}"
+
+
+def _web_base_url(config: dict | None) -> str:
+    port = (config or {}).get("server", {}).get("port", 8300)
+    return _build_server_url(config, port)
+
+
+def _mcp_base_url(config: dict | None, transport: str) -> str:
+    mcp_cfg = (config or {}).get("mcp", {})
+    port = mcp_cfg.get("sse_port", 8201) if transport == "sse" else mcp_cfg.get("http_port", 8200)
+    return _build_server_url(config, port)
+
+
+def _shared_secret_headers(config: dict | None) -> dict[str, str]:
+    secret = str((config or {}).get("network", {}).get("shared_secret", "")).strip()
+    if not secret:
+        return {}
+    return {"X-Agentchattr-Shared-Secret": secret}
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +76,8 @@ SERVER_NAME = "agentchattr"
 # ---------------------------------------------------------------------------
 
 def _write_json_mcp_settings(config_file: Path, url: str, transport: str = "http",
-                              *, token: str = "", http_key: str = "httpUrl") -> Path:
+                              *, token: str = "", http_key: str = "httpUrl",
+                              extra_headers: dict[str, str] | None = None) -> Path:
     """Write/merge a settings-style JSON file with nested mcpServers config.
 
     Preserves existing servers in the file — only updates the agentchattr entry.
@@ -66,8 +107,11 @@ def _write_json_mcp_settings(config_file: Path, url: str, transport: str = "http
         entry: dict = {"type": "http", http_key: url, "trust": True}
     else:
         entry = {"type": transport, "url": url, "trust": True}
+    headers = dict(extra_headers or {})
     if token:
-        entry["headers"] = {"Authorization": f"Bearer {token}"}
+        headers["Authorization"] = f"Bearer {token}"
+    if headers:
+        entry["headers"] = headers
     servers[SERVER_NAME] = entry
     existing["mcpServers"] = servers
 
@@ -102,6 +146,7 @@ def _write_claude_mcp_config(
     url: str,
     *,
     token: str = "",
+    extra_headers: dict[str, str] | None = None,
     project_servers: dict | None = None,
 ) -> Path:
     """Write a Claude Code --mcp-config file with bearer auth.
@@ -115,8 +160,11 @@ def _write_claude_mcp_config(
 
     # Add agentchattr with bearer token for direct server auth
     entry: dict = {"type": "http", "url": url}
+    headers = dict(extra_headers or {})
     if token:
-        entry["headers"] = {"Authorization": f"Bearer {token}"}
+        headers["Authorization"] = f"Bearer {token}"
+    if headers:
+        entry["headers"] = headers
     servers[SERVER_NAME] = entry
 
     payload = {"mcpServers": servers}
@@ -175,13 +223,11 @@ def _resolve_mcp_inject(agent: str, agent_cfg: dict) -> dict:
     return {}
 
 
-def _get_server_url(mcp_cfg: dict, transport: str) -> str:
+def _get_server_url(config: dict | None, mcp_cfg: dict, transport: str) -> str:
     """Build the MCP server URL for the given transport."""
     if transport == "sse":
-        port = mcp_cfg.get("sse_port", 8201)
-        return f"http://127.0.0.1:{port}/sse"
-    port = mcp_cfg.get("http_port", 8200)
-    return f"http://127.0.0.1:{port}/mcp"
+        return f"{_mcp_base_url(config, 'sse')}/sse"
+    return f"{_mcp_base_url(config, 'http')}/mcp"
 
 
 def _apply_mcp_inject(
@@ -191,6 +237,7 @@ def _apply_mcp_inject(
     proxy_url: str | None,
     *,
     token: str = "",
+    config: dict | None = None,
     mcp_cfg: dict | None = None,
     project_dir: Path | None = None,
 ) -> tuple[list[str], dict[str, str], Path | None]:
@@ -208,7 +255,8 @@ def _apply_mcp_inject(
     settings_path: Path | None = None
     config_dir = data_dir / "provider-config"
     transport = inject_cfg.get("mcp_transport", "http")
-    server_url = _get_server_url(mcp_cfg or {}, transport)
+    server_url = _get_server_url(config, mcp_cfg or {}, transport)
+    extra_headers = _shared_secret_headers(config)
 
     http_key = inject_cfg.get("mcp_http_key", "httpUrl")
 
@@ -226,6 +274,7 @@ def _apply_mcp_inject(
             target = base / target
         settings_path = _write_json_mcp_settings(target, server_url,
                                                   transport=transport, token=token,
+                                                  extra_headers=extra_headers,
                                                   http_key=http_key)
         # Optionally set an env var pointing to the settings file
         env_var = inject_cfg.get("mcp_env_var")
@@ -239,7 +288,8 @@ def _apply_mcp_inject(
             raise ValueError(f"mcp_inject = 'env' requires mcp_env_var")
         settings_path = _write_json_mcp_settings(
             config_dir / f"{instance_name}-settings.json",
-            server_url, transport=transport, token=token, http_key=http_key,
+            server_url, transport=transport, token=token,
+            extra_headers=extra_headers, http_key=http_key,
         )
         # Merge project .mcp.json servers into the settings file
         merge_project = inject_cfg.get("mcp_merge_project", False)
@@ -274,7 +324,8 @@ def _apply_mcp_inject(
         project_servers = _read_project_mcp_servers(project_dir) if (merge_project and project_dir) else {}
         settings_path = _write_claude_mcp_config(
             config_dir / f"{instance_name}-mcp.json",
-            server_url, token=token, project_servers=project_servers,
+            server_url, token=token, extra_headers=extra_headers,
+            project_servers=project_servers,
         )
         launch_args = [flag, str(settings_path)]
 
@@ -285,8 +336,11 @@ def _apply_mcp_inject(
         if not env_var:
             raise ValueError("mcp_inject = 'env_content' requires mcp_env_var")
         entry: dict = {"type": "remote", "url": server_url, "enabled": True}
+        headers = dict(extra_headers)
         if token:
-            entry["headers"] = {"Authorization": f"Bearer {token}"}
+            headers["Authorization"] = f"Bearer {token}"
+        if headers:
+            entry["headers"] = headers
         payload = {"mcp": {SERVER_NAME: entry}}
         inject_env[env_var] = json.dumps(payload)
 
@@ -344,6 +398,7 @@ def _build_provider_launch(
     env: dict[str, str],
     *,
     token: str = "",
+    config: dict | None = None,
     mcp_cfg: dict | None = None,
     project_dir: Path | None = None,
 ) -> tuple[list[str], dict[str, str], dict[str, str], Path | None]:
@@ -357,7 +412,7 @@ def _build_provider_launch(
     inject_cfg = _resolve_mcp_inject(agent, agent_cfg)
     mcp_args, inject_env, settings_path = _apply_mcp_inject(
         inject_cfg, instance_name, data_dir, proxy_url,
-        token=token, mcp_cfg=mcp_cfg, project_dir=project_dir,
+        token=token, config=config, mcp_cfg=mcp_cfg, project_dir=project_dir,
     )
 
     launch_args = [*mcp_args, *extra_args]
@@ -366,22 +421,25 @@ def _build_provider_launch(
     return launch_args, launch_env, inject_env, settings_path
 
 
-def _register_instance(server_port: int, base: str, label: str | None = None) -> dict:
+def _register_instance(config: dict, base: str, label: str | None = None) -> dict:
     import urllib.request
 
     reg_body = json.dumps({"base": base, "label": label}).encode()
     reg_req = urllib.request.Request(
-        f"http://127.0.0.1:{server_port}/api/register",
+        f"{_web_base_url(config)}/api/register",
         method="POST",
         data=reg_body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            **_shared_secret_headers(config),
+        },
     )
     with urllib.request.urlopen(reg_req, timeout=5) as reg_resp:
         return json.loads(reg_resp.read())
 
 
-def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
-    headers = {"Authorization": f"Bearer {token}"}
+def _auth_headers(token: str, config: dict | None = None, *, include_json: bool = False) -> dict[str, str]:
+    headers = {"Authorization": f"Bearer {token}", **_shared_secret_headers(config)}
     if include_json:
         headers["Content-Type"] = "application/json"
     return headers
@@ -408,11 +466,14 @@ _IDENTITY_HINT = (
 )
 
 
-def _fetch_role(server_port: int, agent_name: str) -> str:
+def _fetch_role(config: dict, agent_name: str, token: str = "") -> str:
     """Fetch this agent's role from the server status endpoint."""
     try:
         import urllib.request
-        req = urllib.request.Request(f"http://127.0.0.1:{server_port}/api/roles")
+        headers = _shared_secret_headers(config)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(f"{_web_base_url(config)}/api/roles", headers=headers)
         with urllib.request.urlopen(req, timeout=3) as resp:
             roles = json.loads(resp.read())
         return roles.get(agent_name, "")
@@ -420,28 +481,30 @@ def _fetch_role(server_port: int, agent_name: str) -> str:
         return ""
 
 
-def _fetch_active_rules(server_port: int, token: str = "") -> dict | None:
+def _fetch_active_rules(config: dict, token: str = "") -> dict | None:
     """Fetch active rules from the server."""
     try:
         import urllib.request
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        req = urllib.request.Request(f"http://127.0.0.1:{server_port}/api/rules/active", headers=headers)
+        headers = _shared_secret_headers(config)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(f"{_web_base_url(config)}/api/rules/active", headers=headers)
         with urllib.request.urlopen(req, timeout=3) as resp:
             return json.loads(resp.read())
     except Exception:
         return None
 
 
-def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str = ""):
+def _report_rule_sync(config: dict, agent_name: str, epoch: int, token: str = ""):
     """Report that this agent has seen rules at the given epoch."""
     try:
         import urllib.request
         body = json.dumps({"epoch": epoch}).encode()
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **_shared_secret_headers(config)}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(
-            f"http://127.0.0.1:{server_port}/api/rules/agent_sync/{agent_name}",
+            f"{_web_base_url(config)}/api/rules/agent_sync/{agent_name}",
             method="POST",
             data=body,
             headers=headers,
@@ -452,7 +515,7 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
 
 
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
-                   server_port: int = 8300, agent_name: str = "", get_token_fn=None,
+                   config: dict | None = None, server_port: int = 8300, agent_name: str = "", get_token_fn=None,
                    refresh_interval: int = 10):
     """Poll queue file and inject an MCP read task when triggered."""
     first_mention = True
@@ -513,16 +576,16 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
 
                     # Use current identity (may have changed via rename)
                     current_name, _ = get_identity_fn()
+                    _token = get_token_fn() if get_token_fn else ""
                     # Append role if set — check both current name and base name
-                    role = _fetch_role(server_port, current_name)
+                    role = _fetch_role(config or {}, current_name, _token)
                     if not role and current_name != agent_name:
-                        role = _fetch_role(server_port, agent_name)
+                        role = _fetch_role(config or {}, agent_name, _token)
                     if role:
                         prompt += f"\n\nROLE: {role}"
 
                     # Smart rules injection: first trigger, epoch change, or periodic refresh
-                    _token = get_token_fn() if get_token_fn else ""
-                    rules_data = _fetch_active_rules(server_port, _token)
+                    rules_data = _fetch_active_rules(config or {}, _token)
                     trigger_count += 1
                     if rules_data:
                         # Use server-side refresh_interval (live from settings UI)
@@ -537,7 +600,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                                 rules_text = "; ".join(rules_data["rules"])
                                 prompt += f"\n\nRULES:\n{rules_text}"
                             last_rules_epoch = rules_data["epoch"]
-                            _report_rule_sync(server_port, current_name, rules_data["epoch"], _token)
+                            _report_rule_sync(config or {}, current_name, rules_data["epoch"], _token)
 
                     if first_mention and is_multi_instance:
                         prompt += _IDENTITY_HINT
@@ -583,6 +646,9 @@ def main():
     parser.add_argument("--mcp-http-port", default=None, help="Override mcp.http_port (int)")
     parser.add_argument("--mcp-sse-port",  default=None, help="Override mcp.sse_port (int)")
     parser.add_argument("--upload-dir",    default=None, help="Override images.upload_dir (path)")
+    parser.add_argument("--server-host",   default=None, help="Override network.server_host")
+    parser.add_argument("--server-scheme", default=None, help="Override network.server_scheme")
+    parser.add_argument("--shared-secret", default=None, help="Override network.shared_secret")
     args, extra = parser.parse_known_args()
 
     agent = args.agent
@@ -595,7 +661,7 @@ def main():
     mcp_cfg = config.get("mcp", {})
 
     try:
-        registration = _register_instance(server_port, agent, args.label)
+        registration = _register_instance(config, agent, args.label)
     except Exception as exc:
         print(f"  Registration failed ({exc}).")
         print("  Wrapper cannot continue without a registered identity.")
@@ -624,10 +690,10 @@ def main():
 
         transport = inject_cfg.get("mcp_transport", "http")
         if transport == "sse":
-            upstream_base = f"http://127.0.0.1:{mcp_cfg.get('sse_port', 8201)}"
+            upstream_base = _mcp_base_url(config, "sse")
             proxy_path = "/sse"
         else:
-            upstream_base = f"http://127.0.0.1:{mcp_cfg.get('http_port', 8200)}"
+            upstream_base = _mcp_base_url(config, "http")
             proxy_path = "/mcp"
 
         proxy = McpIdentityProxy(
@@ -664,7 +730,7 @@ def main():
         try:
             _apply_mcp_inject(
                 inject_cfg, instance_name, data_dir, proxy_url,
-                token=new_token, mcp_cfg=mcp_cfg,
+                token=new_token, config=config, mcp_cfg=mcp_cfg,
                 project_dir=(ROOT / cwd).resolve(),
             )
         except Exception:
@@ -727,6 +793,7 @@ def main():
         extra_args=extra,
         env=env,
         token=assigned_token,
+        config=config,
         mcp_cfg=mcp_cfg,
         project_dir=project_dir,
     )
@@ -745,13 +812,13 @@ def main():
         while True:
             current_name, _ = get_identity()
             current_token = get_token()
-            url = f"http://127.0.0.1:{server_port}/api/heartbeat/{current_name}"
+            url = f"{_web_base_url(config)}/api/heartbeat/{current_name}"
             try:
                 req = urllib.request.Request(
                     url,
                     method="POST",
                     data=b"",
-                    headers=_auth_headers(current_token),
+                    headers=_auth_headers(current_token, config),
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     resp_data = json.loads(resp.read())
@@ -761,7 +828,7 @@ def main():
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
                     try:
-                        replacement = _register_instance(server_port, agent, args.label)
+                        replacement = _register_instance(config, agent, args.label)
                         set_runtime_identity(replacement["name"], replacement["token"])
                         _notify_recovery(data_dir, replacement["name"])
                     except Exception:
@@ -789,7 +856,7 @@ def main():
             target=_queue_watcher,
             args=(get_identity, inject_fn),
             kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
-                    "server_port": server_port, "agent_name": assigned_name,
+                    "config": config, "server_port": server_port, "agent_name": assigned_name,
                     "get_token_fn": get_token, "refresh_interval": _refresh_interval},
             daemon=True,
         )
@@ -804,7 +871,7 @@ def main():
                     target=_queue_watcher,
                     args=(get_identity, _watcher_inject_fn),
                     kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
-                            "server_port": server_port, "agent_name": assigned_name,
+                            "config": config, "server_port": server_port, "agent_name": assigned_name,
                             "get_token_fn": get_token, "refresh_interval": _refresh_interval},
                     daemon=True,
                 )
@@ -842,13 +909,13 @@ def main():
                 if should_send:
                     current_name, _ = get_identity()
                     current_token = get_token()
-                    url = f"http://127.0.0.1:{server_port}/api/heartbeat/{current_name}"
+                    url = f"{_web_base_url(config)}/api/heartbeat/{current_name}"
                     body = json.dumps({"active": active}).encode()
                     req = urllib.request.Request(
                         url,
                         method="POST",
                         data=body,
-                        headers=_auth_headers(current_token, include_json=True),
+                        headers=_auth_headers(current_token, config, include_json=True),
                     )
                     resp = urllib.request.urlopen(req, timeout=5)
                     resp_code = resp.getcode()
@@ -898,10 +965,10 @@ def main():
             current_name, _ = get_identity()
             current_token = get_token()
             dereg_req = urllib.request.Request(
-                f"http://127.0.0.1:{server_port}/api/deregister/{current_name}",
+                f"{_web_base_url(config)}/api/deregister/{current_name}",
                 method="POST",
                 data=b"",
-                headers=_auth_headers(current_token),
+                headers=_auth_headers(current_token, config),
             )
             urllib.request.urlopen(dereg_req, timeout=5)
             print(f"  Deregistered {current_name}")

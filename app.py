@@ -1,6 +1,10 @@
 """agentchattr — FastAPI web UI + agent auto-trigger."""
 
+from __future__ import annotations
+
 import asyncio
+import hashlib
+import ipaddress
 import json
 import re as _re
 import sys
@@ -8,10 +12,11 @@ import threading
 import uuid
 import logging
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.requests import Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from store import MessageStore
@@ -24,6 +29,7 @@ from agents import AgentTrigger
 from registry import RuntimeRegistry
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
+from uploads import INLINE_IMAGE_EXTS, classify_upload, get_upload_dir, write_upload_bytes
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +51,9 @@ ws_clients: set[WebSocket] = set()
 
 # --- Security: session token (set by configure()) ---
 session_token: str = ""
+_SESSION_COOKIE = "agentchattr_session"
+_ACCESS_COOKIE = "agentchattr_access"
+_SHARED_SECRET_HEADER = "x-agentchattr-shared-secret"
 
 # Room settings (persisted to data/settings.json)
 room_settings: dict = {
@@ -63,6 +72,120 @@ MAX_CHANNELS = 8
 
 # Agent hats (persisted to data/hats.json)
 agent_hats: dict[str, str] = {}  # { agent_name: svg_string }
+
+
+def _network_cfg() -> dict:
+    return config.get("network", {})
+
+
+def _shared_secret() -> str:
+    return str(_network_cfg().get("shared_secret", "")).strip()
+
+
+def _access_cookie_value() -> str:
+    if not session_token or not _shared_secret():
+        return ""
+    return hashlib.sha256(f"{_shared_secret()}:{session_token}".encode("utf-8")).hexdigest()
+
+
+def _is_loopback_host(host: str) -> bool:
+    raw = (host or "").strip().lower()
+    if not raw:
+        return False
+    if raw == "localhost":
+        return True
+    raw = raw.split("%", 1)[0].strip("[]")
+    try:
+        return ipaddress.ip_address(raw).is_loopback
+    except ValueError:
+        return False
+
+
+def _client_ip(conn) -> str:
+    client = getattr(conn, "client", None)
+    return getattr(client, "host", "") if client else ""
+
+
+def _is_local_client(conn) -> bool:
+    return _is_loopback_host(_client_ip(conn))
+
+
+def _remote_access_enabled() -> bool:
+    return bool(_shared_secret())
+
+
+def _browser_has_access(request: Request) -> bool:
+    if _is_local_client(request):
+        return True
+    expected = _access_cookie_value()
+    if not expected:
+        return False
+    return request.cookies.get(_ACCESS_COOKIE, "") == expected
+
+
+def _browser_has_access_ws(websocket: WebSocket) -> bool:
+    if _is_local_client(websocket):
+        return True
+    expected = _access_cookie_value()
+    if not expected:
+        return False
+    return websocket.cookies.get(_ACCESS_COOKIE, "") == expected
+
+
+def _agent_shared_secret_valid(request: Request) -> bool:
+    if _is_local_client(request):
+        return True
+    secret = _shared_secret()
+    if not secret:
+        return False
+    return request.headers.get(_SHARED_SECRET_HEADER, "").strip() == secret
+
+
+def _agent_shared_secret_valid_ws(ctx) -> bool:
+    if _is_local_client(ctx):
+        return True
+    secret = _shared_secret()
+    if not secret:
+        return False
+    return ctx.headers.get(_SHARED_SECRET_HEADER, "").strip() == secret
+
+
+def _origin_allowed(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    host = request.headers.get("host", "").strip().lower()
+    try:
+        parsed = urlsplit(origin)
+    except Exception:
+        return False
+    return parsed.netloc.lower() == host
+
+
+def _set_browser_session_cookies(response: Response, request: Request):
+    secure = request.url.scheme == "https"
+    response.set_cookie(
+        _SESSION_COOKIE,
+        session_token,
+        httponly=True,
+        samesite="strict",
+        secure=secure,
+        path="/",
+    )
+    if not _is_local_client(request) and _remote_access_enabled():
+        response.set_cookie(
+            _ACCESS_COOKIE,
+            _access_cookie_value(),
+            httponly=True,
+            samesite="strict",
+            secure=secure,
+            path="/",
+        )
+
+
+def _clear_browser_cookies(response: Response):
+    response.delete_cookie(_SESSION_COOKIE, path="/")
+    response.delete_cookie(_ACCESS_COOKIE, path="/")
 
 
 def _hats_path() -> Path:
@@ -162,65 +285,77 @@ def _resolve_authenticated_agent(request: Request) -> dict | None:
     return registry.resolve_token(token)
 
 
-# --- Security middleware ---
-# Paths that don't require the session token (public assets).
-_PUBLIC_PREFIXES = ("/", "/static/")
-
-
 def _install_security_middleware(token: str, cfg: dict):
-    """Add token validation and origin checking middleware to the app."""
+    """Add browser/agent access control middleware to the app."""
     import app as _self
     _self.session_token = token
-    port = cfg.get("server", {}).get("port", 8300)
-    allowed_origins = {
-        f"http://127.0.0.1:{port}",
-        f"http://localhost:{port}",
-    }
 
     class SecurityMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
             path = request.url.path
+            remote = not _is_local_client(request)
 
-            # Static assets, index page, and uploaded images are public.
-            # The index page injects the token client-side via same-origin script.
-            # Uploads use random filenames and have path-traversal protection.
-            if path == "/" or path.startswith(("/static/", "/uploads/", "/api/roles")):
+            # Static assets and auth entry points stay public so remote users can log in.
+            if path == "/" or path.startswith("/static/") or path in ("/auth/login", "/auth/logout"):
                 return await call_next(request)
 
-            # Agent registration/heartbeat: loopback only (no remote agent minting).
-            if path.startswith(("/api/register", "/api/deregister/", "/api/heartbeat/")):
-                client_ip = request.client.host if request.client else ""
-                if client_ip not in ("127.0.0.1", "::1", "localhost"):
-                    return JSONResponse(
-                        {"error": f"forbidden: agent registration is restricted to local loopback. Source {client_ip} is not allowed."},
-                        status_code=403,
-                    )
-                return await call_next(request)
+            if remote and not _remote_access_enabled():
+                return JSONResponse(
+                    {"error": "forbidden: remote access is disabled until network.shared_secret is set"},
+                    status_code=403,
+                )
+
+            if path.startswith("/api/open-path") and remote:
+                return JSONResponse(
+                    {"error": "forbidden: open-path is restricted to the local machine"},
+                    status_code=403,
+                )
 
             # --- Origin check (blocks cross-origin / DNS-rebinding attacks) ---
-            origin = request.headers.get("origin")
-            if origin and origin not in allowed_origins:
+            if not _origin_allowed(request):
                 return JSONResponse(
                     {"error": "forbidden: origin not allowed"},
                     status_code=403,
                 )
 
-            # --- Token check ---
-            # Allow registered agents to authenticate via Bearer token
-            # for /api/messages and /api/send (no browser session needed).
+            # Agent registration stays separate from browser auth.
+            if path.startswith(("/api/register", "/api/deregister/", "/api/heartbeat/")):
+                if not _agent_shared_secret_valid(request):
+                    return JSONResponse(
+                        {"error": "forbidden: valid shared secret required for remote agent access"},
+                        status_code=403,
+                    )
+                return await call_next(request)
+
+            # Registered agents can authenticate with bearer tokens for API usage.
             auth_header = request.headers.get("authorization", "")
-            if auth_header.lower().startswith("bearer ") and (path in ("/api/messages", "/api/send") or path.startswith("/api/rules/")):
+            if auth_header.lower().startswith("bearer "):
                 bearer = auth_header[7:].strip()
-                if _self.registry and _self.registry.resolve_token(bearer):
+                agent_allowed_paths = (
+                    path in ("/api/messages", "/api/send", "/api/status", "/api/roles")
+                    or path.startswith("/api/rules/")
+                )
+                if agent_allowed_paths and _self.registry and _self.registry.resolve_token(bearer):
+                    if not _agent_shared_secret_valid(request):
+                        return JSONResponse(
+                            {"error": "forbidden: valid shared secret required for remote agent access"},
+                            status_code=403,
+                        )
                     return await call_next(request)
 
             req_token = (
                 request.headers.get("x-session-token")
                 or request.query_params.get("token")
+                or request.cookies.get(_SESSION_COOKIE)
             )
             if req_token != _self.session_token:
                 return JSONResponse(
                     {"error": "forbidden: invalid or missing session token"},
+                    status_code=403,
+                )
+            if not _browser_has_access(request):
+                return JSONResponse(
+                    {"error": "forbidden: browser access not granted"},
                     status_code=403,
                 )
 
@@ -1012,9 +1147,9 @@ def _on_registry_change():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # --- Security: validate session token on WebSocket connect ---
-    token = websocket.query_params.get("token", "")
-    if token != session_token:
+    # --- Security: validate browser session + remote access gate ---
+    token = websocket.query_params.get("token", "") or websocket.cookies.get(_SESSION_COOKIE, "")
+    if token != session_token or not _browser_has_access_ws(websocket):
         # Must accept before closing so the browser receives the close frame.
         # Code 4003 triggers an auto-reload in the client to pick up the new token.
         await websocket.accept()
@@ -1409,32 +1544,57 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # --- REST endpoints ---
 
-ALLOWED_UPLOAD_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'}
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB default
-
 
 @app.post("/api/upload")
-async def upload_image(file: UploadFile = File(...)):
-    upload_dir = Path(config.get("images", {}).get("upload_dir", "./uploads"))
-    upload_dir.mkdir(parents=True, exist_ok=True)
-
-    ext = Path(file.filename).suffix or ".png"
-    if ext.lower() not in ALLOWED_UPLOAD_EXTS:
-        return JSONResponse({"error": f"unsupported file type: {ext}"}, status_code=400)
-
+async def upload_file(file: UploadFile = File(...)):
+    if not file.filename:
+        return JSONResponse({"error": "filename required"}, status_code=400)
     content = await file.read()
     max_bytes = config.get("images", {}).get("max_size_mb", 10) * 1024 * 1024
     if len(content) > max_bytes:
         return JSONResponse({"error": f"file too large (max {max_bytes // 1024 // 1024} MB)"}, status_code=400)
 
-    filename = f"{uuid.uuid4().hex[:8]}{ext}"
-    filepath = upload_dir / filename
-    filepath.write_bytes(content)
+    info = classify_upload(file.filename, content_type=file.content_type or "")
+    if info is None:
+        ext = Path(file.filename).suffix or "(no extension)"
+        return JSONResponse({"error": f"unsupported file type: {ext}"}, status_code=400)
 
-    return JSONResponse({
-        "name": file.filename,
-        "url": f"/uploads/{filename}",
-    })
+    attachment = write_upload_bytes(file.filename, content, config, content_type=file.content_type or "")
+    return JSONResponse(attachment)
+
+
+@app.post("/auth/login")
+async def browser_login(request: Request):
+    if _is_local_client(request):
+        response = RedirectResponse("/", status_code=303)
+        _set_browser_session_cookies(response, request)
+        return response
+    if not _remote_access_enabled():
+        return JSONResponse({"error": "remote access is disabled"}, status_code=403)
+
+    try:
+        body = await request.form()
+        provided = str(body.get("secret", "")).strip()
+    except Exception:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        provided = str(body.get("secret", "")).strip()
+
+    if provided != _shared_secret():
+        return JSONResponse({"error": "invalid access secret"}, status_code=403)
+
+    response = RedirectResponse("/", status_code=303)
+    _set_browser_session_cookies(response, request)
+    return response
+
+
+@app.post("/auth/logout")
+async def browser_logout():
+    response = RedirectResponse("/", status_code=303)
+    _clear_browser_cookies(response)
+    return response
 
 
 # --- Export / Import ---
@@ -2602,10 +2762,14 @@ async def version_check():
 
 @app.get("/uploads/{filename}")
 async def serve_upload(filename: str):
-    upload_dir = Path(config.get("images", {}).get("upload_dir", "./uploads"))
+    upload_dir = get_upload_dir(config).resolve()
     filepath = (upload_dir / filename).resolve()
-    if not filepath.is_relative_to(upload_dir.resolve()):
+    if not filepath.is_relative_to(upload_dir):
         return JSONResponse({"error": "invalid path"}, status_code=400)
     if filepath.exists():
-        return FileResponse(filepath)
+        info = classify_upload(filepath.name) or {"kind": "file", "media_type": "application/octet-stream"}
+        headers = {"X-Content-Type-Options": "nosniff"}
+        if info["kind"] != "image":
+            headers["Content-Disposition"] = f'attachment; filename="{filepath.name}"'
+        return FileResponse(filepath, media_type=info["media_type"], headers=headers)
     return JSONResponse({"error": "not found"}, status_code=404)
